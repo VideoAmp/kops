@@ -28,10 +28,12 @@ import (
 	"k8s.io/kops/cmd/kops/util"
 	api "k8s.io/kops/pkg/apis/kops"
 	"k8s.io/kops/upup/pkg/fi/cloudup"
+	"k8s.io/kubernetes/pkg/kubectl/resource"
 	"k8s.io/kubernetes/pkg/kubectl/cmd/util/editor"
 )
 
 type EditInstanceGroupOptions struct {
+	resource.FilenameOptions
 }
 
 func NewCmdEditInstanceGroup(f *util.Factory, out io.Writer) *cobra.Command {
@@ -122,6 +124,110 @@ func RunEditInstanceGroup(f *util.Factory, cmd *cobra.Command, args []string, ou
 	}
 
 	newObj, _, err := api.ParseVersionedYaml(edited)
+	if err != nil {
+		return fmt.Errorf("error parsing InstanceGroup: %v", err)
+	}
+
+	newGroup, ok := newObj.(*api.InstanceGroup)
+	if !ok {
+		return fmt.Errorf("object was not of expected type: %T", newObj)
+	}
+
+	err = newGroup.Validate()
+	if err != nil {
+		return err
+	}
+
+	fullGroup, err := cloudup.PopulateInstanceGroupSpec(cluster, newGroup, channel)
+	if err != nil {
+		return err
+	}
+
+	// We need the full cluster spec to perform deep validation
+	// Note that we don't write it back though
+	err = cloudup.PerformAssignments(cluster)
+	if err != nil {
+		return fmt.Errorf("error populating configuration: %v", err)
+	}
+
+	fullCluster, err := cloudup.PopulateClusterSpec(cluster)
+	if err != nil {
+		return err
+	}
+
+	err = fullGroup.CrossValidate(fullCluster, true)
+	if err != nil {
+		return err
+	}
+
+	// Note we perform as much validation as we can, before writing a bad config
+	_, err = clientset.InstanceGroups(cluster.ObjectMeta.Name).Update(fullGroup)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func RunEditInstanceGroupFromFile(clusterName string, groupName string, edited []byte) error {
+
+	cluster, err := rootCommand.Cluster()
+	if err != nil {
+		return err
+	}
+
+	clientset, err := rootCommand.Clientset()
+	if err != nil {
+		return err
+	}
+
+	if groupName == "" {
+		return fmt.Errorf("name is required")
+	}
+
+	oldGroup, err := clientset.InstanceGroups(cluster.ObjectMeta.Name).Get(groupName)
+	if err != nil {
+		return fmt.Errorf("error reading InstanceGroup %q: %v", groupName, err)
+	}
+
+	if oldGroup == nil {
+		return fmt.Errorf("InstanceGroup %q not found", groupName)
+	}
+
+	raw, err := api.ToVersionedYaml(oldGroup)
+	if err != nil {
+		return err
+	}
+
+	edited = bytes.Trim(edited, "\n")
+	raw = bytes.Trim(raw, "\n")
+	if bytes.Equal(edited, raw) {
+		fmt.Fprintln(os.Stderr, "Edit cancelled, no changes made.")
+		return nil
+	}
+
+	err = SaveInstanceGroups(cluster, edited)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func SaveInstanceGroups(cluster *api.Cluster, yamlByte []byte) error {
+
+	fmt.Fprintln(os.Stderr, "changes to be made.")
+	clientset, err := rootCommand.Clientset()
+	if err != nil {
+		return err
+	}
+
+	channel, err := cloudup.ChannelForCluster(cluster)
+	if err != nil {
+		return err
+	}
+
+	newObj, _, err := api.ParseVersionedYaml(yamlByte)
 	if err != nil {
 		return fmt.Errorf("error parsing InstanceGroup: %v", err)
 	}

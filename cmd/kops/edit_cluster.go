@@ -17,9 +17,9 @@ limitations under the License.
 package main
 
 import (
+	"fmt"
 	"bufio"
 	"bytes"
-	"fmt"
 	"github.com/spf13/cobra"
 	"io"
 	"k8s.io/kops/cmd/kops/util"
@@ -28,6 +28,7 @@ import (
 	"k8s.io/kops/pkg/apis/kops/validation"
 	"k8s.io/kops/pkg/edit"
 	"k8s.io/kops/upup/pkg/fi/cloudup"
+	"k8s.io/kubernetes/pkg/kubectl/resource"
 	k8sapi "k8s.io/kubernetes/pkg/api"
 	util_editor "k8s.io/kubernetes/pkg/kubectl/cmd/util/editor"
 	"os"
@@ -36,6 +37,7 @@ import (
 )
 
 type EditClusterOptions struct {
+	resource.FilenameOptions
 }
 
 func NewCmdEditCluster(f *util.Factory, out io.Writer) *cobra.Command {
@@ -320,4 +322,111 @@ func preservedFile(err error, path string, out io.Writer) error {
 		}
 	}
 	return err
+}
+
+func RunEditClusterFromFile(clusterName string, edited []byte) error {
+
+	raw, _, err := GetOldClusterRaw()
+	if err != nil {
+		return err
+	}
+
+	if(BytesEqual(edited, raw)) {
+		fmt.Fprintln(os.Stderr, "Edit cancelled, no changes made.")
+		return nil
+	}
+
+	err = SaveCluster(clusterName, edited)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func GetOldClusterRaw() ([]byte, *api.Cluster, error) {
+
+	oldCluster, err := rootCommand.Cluster()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	err = oldCluster.FillDefaults()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	raw, err := api.ToVersionedYaml(oldCluster)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return raw, oldCluster, nil
+}
+
+func SaveCluster(clusterName string, yamlByte []byte) error {
+
+	fmt.Fprintln(os.Stderr, "changes to be made.")
+	clientset, err := rootCommand.Clientset()
+	if err != nil {
+		return err
+	}
+
+	list, err := clientset.InstanceGroups(clusterName).List(k8sapi.ListOptions{})
+	if err != nil {
+		return err
+	}
+	var instancegroups []*api.InstanceGroup
+	for i := range list.Items {
+		instancegroups = append(instancegroups, &list.Items[i])
+	}
+
+	newObj, _, err := api.ParseVersionedYaml(yamlByte)
+	if err != nil {
+		return fmt.Errorf("error parsing config: %v", err)
+	}
+
+	newCluster, ok := newObj.(*api.Cluster)
+	if !ok {
+		return fmt.Errorf("object was not of expected type: %T", newObj)
+	}
+	err = cloudup.PerformAssignments(newCluster)
+	if err != nil {
+		return fmt.Errorf("error populating configuration: %v", err)
+	}
+
+	fullCluster, err := cloudup.PopulateClusterSpec(newCluster)
+	if err != nil {
+		return err
+	}
+
+	err = validation.DeepValidate(fullCluster, instancegroups, true)
+	if err != nil {
+		return err
+	}
+
+	configBase, err := registry.ConfigBase(newCluster)
+	if err != nil {
+		return err
+	}
+
+	// Note we perform as much validation as we can, before writing a bad config
+	_, err = clientset.Clusters().Update(newCluster)
+	if err != nil {
+		return err
+	}
+
+	err = registry.WriteConfigDeprecated(configBase.Join(registry.PathClusterCompleted), fullCluster)
+	if err != nil {
+		return fmt.Errorf("error writing completed cluster spec: %v", err)
+	}
+
+	return nil
+}
+
+func BytesEqual(one []byte, two []byte) bool {
+	if bytes.Equal(bytes.Trim(one, "\n"), bytes.Trim(two, "\n")) {
+		return true
+	}
+	return false
 }
